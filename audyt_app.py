@@ -101,7 +101,7 @@ def main():
                             rows.append(row)
                             live.caption(
                                 f"Zebrane wiersze: {len(rows)} · "
-                                f"ostatnio: {row['Link'] or row['Zrodlo']}")
+                                f"ostatnio: {row['Link'] or row['URL']}")
                     except Exception as e:
                         st.error(f"Błąd przy {firm}: {e}")
                 status.update(label=f"Gotowe. Wierszy: {len(rows)}", state="complete")
@@ -112,7 +112,7 @@ def main():
     if not rows:
         return
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).reindex(columns=af.FIELDNAMES).fillna("")
     st.subheader("Wyniki")
 
     counts = df["Status"].value_counts()
@@ -127,9 +127,10 @@ def main():
     sel_types = f2.multiselect("Typ", types, default=types, key="flt_typ")
 
     view = df[df["Status"].isin(sel_status) & df["Typ"].isin(sel_types)].copy()
-    view["Link"] = view["Link"].replace("", None)
+    for col in ("URL", "Link"):
+        view[col] = view[col].replace("", None)
 
-    columns = ["Typ", "Status", "Opis", "Link", "Zrodlo"]
+    columns = ["Typ", "Status", "Opis", "URL", "Link"]
     if df["Firma_URL"].nunique() > 1:
         columns.insert(0, "Firma_URL")
 
@@ -137,8 +138,8 @@ def main():
         view[columns],
         hide_index=True,
         column_config={
-            "Link": st.column_config.LinkColumn("Link"),
-            "Zrodlo": st.column_config.LinkColumn("Źródło"),
+            "URL": st.column_config.LinkColumn("URL (produkt / artykuł)"),
+            "Link": st.column_config.LinkColumn("Link w artykule"),
         },
     )
     st.caption("`NIEPEWNE` (401/403/429/999) – serwer mógł zablokować bota, "
