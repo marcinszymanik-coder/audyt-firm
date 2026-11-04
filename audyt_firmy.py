@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Audyt linków firmy na budujemydom.pl:
-  1) linki produktowe ("Zobacz na stronie producenta") z zakładki firmy,
+  1) linki produktowe ("Zobacz na stronie producenta") z zakładki firmy
+     (w raporcie: adres strony produktu na budujemydom.pl),
   2) linki zewnętrzne w artykułach z zakładek /porady i /newsy.
 
 Użycie jako skrypt:
@@ -37,9 +38,12 @@ MAX_LISTING_PAGES = 50         # bezpiecznik paginacji na jedną zakładkę
 UNCERTAIN_CODES = {401, 403, 429, 999}
 PRODUCT_BTN_TEXT = 'zobacz na stronie producenta'
 ARTICLE_PATH_RE = re.compile(r'/\d+-[^/]+/?$')     # np. /porady/12345-tytul
+PRODUCT_PATH_RE = re.compile(r'/p/\d+-[^/]+/?$')   # np. /firma/p/30376-nazwa
 STRIP_TAB_RE = re.compile(r'(/(porady|newsy))?(/s/\d+)?/?$')
+HEADING_TAGS = ['h1', 'h2', 'h3', 'h4', 'h5']
 
-FIELDNAMES = ['Firma_URL', 'Typ', 'Zrodlo', 'Link', 'Status', 'Opis']
+# URL = adres produktu (dla produktów) lub adres artykułu (dla artykułów)
+FIELDNAMES = ['Firma_URL', 'Typ', 'URL', 'Link', 'Status', 'Opis']
 
 log = logging.getLogger('audyt')
 
@@ -60,12 +64,14 @@ def make_session():
 
 SESSION = make_session()
 _link_cache = {}
+_outbound_cache = {}
 _cache_lock = threading.Lock()
 
 
 def clear_cache():
     with _cache_lock:
         _link_cache.clear()
+        _outbound_cache.clear()
 
 
 def is_safe_url(url):
@@ -158,6 +164,11 @@ def firm_base_url(url):
     return STRIP_TAB_RE.sub('', url)
 
 
+def _row(firm, typ, url, link, status, desc):
+    return {'Firma_URL': firm, 'Typ': typ, 'URL': url,
+            'Link': link, 'Status': status, 'Opis': desc}
+
+
 # ---------------------------------------------------------------- listy z paginacją
 
 def crawl_listing(tab_url):
@@ -190,16 +201,118 @@ def crawl_listing(tab_url):
 
 # ---------------------------------------------------------------- produkty
 
-def extract_product_links(soup, page_url):
-    links = []
-    for a in soup.find_all('a', href=True):
-        classes = a.get('class') or []
-        text = a.get_text(' ', strip=True).lower()
-        if 'firm__product-btn' in classes or PRODUCT_BTN_TEXT in text:
-            href = urljoin(page_url, a['href'].strip())
-            if urlparse(href).scheme in ('http', 'https') and href not in links:
-                links.append(href)
-    return links
+def _is_product_btn(a):
+    classes = a.get('class') or []
+    text = a.get_text(' ', strip=True).lower()
+    return 'firm__product-btn' in classes or PRODUCT_BTN_TEXT in text
+
+
+def _slug_name(url):
+    last = urlparse(url).path.rstrip('/').split('/')[-1]
+    return re.sub(r'^\d+-', '', last).replace('-', ' ').strip()
+
+
+def extract_product_items(soup, page_url):
+    """Zwraca listę produktów z listy firmy:
+    {'name', 'product_url', 'outbound', 'page'}
+      outbound - link z przycisku, jeśli prowadzi poza budujemydom.pl (inaczej None),
+      page     - strona do pobrania, gdy trzeba z niej wyciągnąć link do producenta.
+    Nazwę (tylko do trybu debug) i adres produktu szuka w najmniejszym kontenerze
+    wokół przycisku, który zawiera tylko jeden przycisk produktowy."""
+    base_domain = normalize_host(urlparse(page_url).netloc)
+    items, seen = [], set()
+
+    for btn in soup.find_all('a', href=True):
+        if not _is_product_btn(btn):
+            continue
+        btn_href = urljoin(page_url, btn['href'].strip())
+        if urlparse(btn_href).scheme not in ('http', 'https'):
+            continue
+
+        product_url, name, tile = '', '', None
+        node = btn.parent
+        for _ in range(6):
+            if node is None:
+                break
+            anchors = node.find_all('a', href=True)
+            if sum(1 for x in anchors if _is_product_btn(x)) > 1:
+                break                      # za duży kontener (kilka produktów)
+            tile = node
+            link = None
+            for a in anchors:
+                href = urljoin(page_url, a['href'].strip())
+                if (not is_external(href, base_domain)
+                        and PRODUCT_PATH_RE.search(urlparse(href).path)):
+                    link, product_url = a, clean_url(href)
+                    break
+            if link is not None:
+                heading = node.find(HEADING_TAGS)
+                if heading:
+                    name = heading.get_text(' ', strip=True)
+                if not name and not _is_product_btn(link):
+                    name = link.get_text(' ', strip=True) or (link.get('title') or '').strip()
+                break
+            node = node.parent
+
+        if not name and tile is not None:
+            heading = tile.find(HEADING_TAGS)
+            if heading:
+                name = heading.get_text(' ', strip=True)
+        if not name and product_url:
+            name = _slug_name(product_url)
+
+        outbound = btn_href if is_external(btn_href, base_domain) else None
+        key = product_url or btn_href
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({'name': name, 'product_url': product_url,
+                      'outbound': outbound,
+                      'page': btn_href if outbound is None else product_url})
+    return items
+
+
+def resolve_outbound(product_page_url):
+    """Z wewnętrznej strony produktu wyciąga link do producenta (lub None)."""
+    if not product_page_url:
+        return None
+    with _cache_lock:
+        if product_page_url in _outbound_cache:
+            return _outbound_cache[product_page_url]
+    soup = fetch_soup(product_page_url)
+    time.sleep(DELAY)
+    result = None
+    if soup is not None:
+        base_domain = normalize_host(urlparse(product_page_url).netloc)
+        for a in soup.find_all('a', href=True):
+            if _is_product_btn(a):
+                href = urljoin(product_page_url, a['href'].strip())
+                if (urlparse(href).scheme in ('http', 'https')
+                        and is_external(href, base_domain)):
+                    result = href
+                    break
+    with _cache_lock:
+        _outbound_cache[product_page_url] = result
+    return result
+
+
+def _product_rows(firm, page_url, items):
+    for it in items:
+        it['final'] = it['outbound'] or resolve_outbound(it['page'])
+
+    unique = list(dict.fromkeys(it['final'] for it in items if it['final']))
+    status_map = dict(zip(unique, check_many(unique)))
+
+    for it in items:
+        # adres produktu na budujemydom.pl; jeśli go nie znaleziono, podajemy stronę listy
+        product_ref = it['product_url'] or page_url
+        link = it['final']
+        if not link:
+            status, desc = 'BRAK', 'Nie znaleziono linku do producenta'
+        else:
+            status, desc = status_map[link]
+        # w raporcie: URL = adres produktu, kolumna Link pusta
+        yield _row(firm, 'Produkt', product_ref, '', status, desc)
 
 
 # ---------------------------------------------------------------- artykuły
@@ -249,14 +362,12 @@ def extract_article_external_links(content_area, page_url):
     return links
 
 
+def _article_rows(firm, article_url, links):
+    for link, (status, desc) in zip(links, check_many(links)):
+        yield _row(firm, 'Artykuł', article_url, link, status, desc)
+
+
 # ---------------------------------------------------------------- audyt
-
-def _rows_for_links(firm, typ, source, links):
-    results = check_many(links)
-    for link, (status, desc) in zip(links, results):
-        yield {'Firma_URL': firm, 'Typ': typ, 'Zrodlo': source,
-               'Link': link, 'Status': status, 'Opis': desc}
-
 
 def audit_firm(firm_url, debug=False, include_products=True, include_articles=True):
     """Generator wierszy raportu dla jednej firmy.
@@ -268,17 +379,19 @@ def audit_firm(firm_url, debug=False, include_products=True, include_articles=Tr
     if include_products:
         found_products = False
         for page_url, soup in crawl_listing(base):
-            links = extract_product_links(soup, page_url)
-            log.info('  Produkty %s: %d linków', page_url, len(links))
-            found_products = found_products or bool(links)
+            items = extract_product_items(soup, page_url)
+            log.info('  Produkty %s: %d', page_url, len(items))
+            found_products = found_products or bool(items)
             if debug:
-                for l in links:
-                    print(f'[PRODUKT] {l}')
+                for it in items:
+                    print(f"[PRODUKT] {it['name'] or '(brak nazwy)'} | "
+                          f"{it['product_url'] or '(brak adresu produktu)'} | "
+                          f"{it['outbound'] or '(link przez stronę produktu)'}")
                 continue
-            yield from _rows_for_links(base, 'Produkt', page_url, links)
+            yield from _product_rows(base, page_url, items)
         if not found_products and not debug:
-            yield {'Firma_URL': base, 'Typ': 'Produkt', 'Zrodlo': base, 'Link': '',
-                   'Status': 'BRAK', 'Opis': 'Nie znaleziono linków produktowych'}
+            yield _row(base, 'Produkt', base, '', 'BRAK',
+                       'Nie znaleziono linków produktowych')
 
     # 2) artykuły (porady + newsy)
     if include_articles:
@@ -296,23 +409,20 @@ def audit_firm(firm_url, debug=False, include_products=True, include_articles=Tr
                     art_soup = fetch_soup(art_url)
                     time.sleep(DELAY)
                     if art_soup is None:
-                        yield {'Firma_URL': base, 'Typ': 'Artykuł', 'Zrodlo': art_url,
-                               'Link': '', 'Status': 'BLAD',
-                               'Opis': 'Błąd pobierania artykułu'}
+                        yield _row(base, 'Artykuł', art_url, '', 'BLAD',
+                                   'Błąd pobierania artykułu')
                         continue
                     area = find_content_area(art_soup)
                     if area is None:
-                        yield {'Firma_URL': base, 'Typ': 'Artykuł', 'Zrodlo': art_url,
-                               'Link': '', 'Status': 'BRAK',
-                               'Opis': 'Nie znaleziono treści artykułu'}
+                        yield _row(base, 'Artykuł', art_url, '', 'BRAK',
+                                   'Nie znaleziono treści artykułu')
                         continue
                     links = extract_article_external_links(area, art_url)
                     if not links:
-                        yield {'Firma_URL': base, 'Typ': 'Artykuł', 'Zrodlo': art_url,
-                               'Link': '', 'Status': 'BRAK',
-                               'Opis': 'Brak linków zewnętrznych w tekście'}
+                        yield _row(base, 'Artykuł', art_url, '', 'BRAK',
+                                   'Brak linków zewnętrznych w tekście')
                         continue
-                    yield from _rows_for_links(base, 'Artykuł', art_url, links)
+                    yield from _article_rows(base, art_url, links)
 
 
 # ---------------------------------------------------------------- CLI
