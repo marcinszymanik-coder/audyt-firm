@@ -1,0 +1,5 @@
+streamlit[auth]>=1.42
+Authlib>=1.3.2
+requests
+beautifulsoup4
+pandas
