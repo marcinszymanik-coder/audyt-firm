@@ -8,7 +8,8 @@ Audyt linków firmy na budujemydom.pl:
 Użycie jako skrypt:
   python audyt_firmy.py https://budujemydom.pl/irbj/.../fakro
   python audyt_firmy.py -i firmy.txt -o raport.csv
-  python audyt_firmy.py URL --debug      # pokaż znalezione linki, bez sprawdzania
+  python audyt_firmy.py URL --debug              # pokaż znalezione linki, bez sprawdzania
+  python audyt_firmy.py --diagnose URL_ARTYKULU  # co skrypt widzi w jednym artykule
   (bez argumentów skrypt zapyta o linki)
 
 Użycie jako moduł (Streamlit): audit_firm(url, include_products=..., include_articles=...)
@@ -29,7 +30,13 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+try:
+    from curl_cffi import requests as cffi_requests
+except Exception:          # biblioteka opcjonalna
+    cffi_requests = None
+
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 PAGE_TIMEOUT = 15
 LINK_TIMEOUT = 10
 LINK_WORKERS = 8
@@ -42,6 +49,12 @@ PRODUCT_PATH_RE = re.compile(r'/p/\d+-[^/]+/?$')   # np. /firma/p/30376-nazwa
 STRIP_TAB_RE = re.compile(r'(/(porady|newsy))?(/s/\d+)?/?$')
 HEADING_TAGS = ['h1', 'h2', 'h3', 'h4', 'h5']
 
+# wyłączenia przy szukaniu linków w treści artykułu
+SKIP_TAGS = ['header', 'nav', 'footer', 'aside', 'form']
+SKIP_CLASS_RE = re.compile(r'(share|social|author|autor|breadcrumb|comment|newsletter|related)', re.I)
+SOCIAL_HOSTS = ('facebook.com', 'twitter.com', 'x.com', 'linkedin.com',
+                'pinterest.com', 'whatsapp.com', 'wa.me')
+
 # URL = adres produktu (dla produktów) lub adres artykułu (dla artykułów)
 FIELDNAMES = ['Firma_URL', 'Typ', 'URL', 'Link', 'Status', 'Opis']
 
@@ -52,7 +65,12 @@ log = logging.getLogger('audyt')
 
 def make_session():
     session = requests.Session()
-    session.headers.update({'User-Agent': USER_AGENT})
+    session.headers.update({
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+    })
     retry = Retry(total=2, backoff_factor=0.5,
                   status_forcelist=[502, 503, 504],
                   allowed_methods=['GET', 'HEAD'])
@@ -90,8 +108,39 @@ def is_safe_url(url):
         return False
 
 
+def _http_status(url):
+    """HEAD, a przy błędzie GET. Zwraca kod HTTP; wyjątki sieciowe propaguje."""
+    r = SESSION.head(url, timeout=LINK_TIMEOUT, allow_redirects=True)
+    if r.status_code >= 400:
+        r = SESSION.get(url, timeout=LINK_TIMEOUT, stream=True, allow_redirects=True)
+        r.close()
+    return r.status_code
+
+
+def _second_opinion(url):
+    """Drugi klient z odciskiem TLS Chrome (omija część blokad botów).
+    None = klient niedostępny lub błąd."""
+    if cffi_requests is None:
+        return None
+    try:
+        r = cffi_requests.get(url, impersonate='chrome',
+                              timeout=LINK_TIMEOUT, allow_redirects=True)
+        return r.status_code
+    except Exception:
+        return None
+
+
+def _classify(code):
+    if code < 400:
+        return 'OK'
+    if code in UNCERTAIN_CODES:
+        return 'NIEPEWNE'
+    return 'BLAD'
+
+
 def check_external_link(url):
-    """Zwraca ('OK' | 'NIEPEWNE' | 'BLAD', opis). Wyniki są cache'owane."""
+    """Zwraca ('OK' | 'NIEPEWNE' | 'BLAD', opis). Wyniki są cache'owane.
+    Błąd jest potwierdzany drugim klientem, żeby ograniczyć fałszywe alarmy."""
     with _cache_lock:
         if url in _link_cache:
             return _link_cache[url]
@@ -99,22 +148,25 @@ def check_external_link(url):
     if not is_safe_url(url):
         return ('BLAD', 'Niedozwolony lub nieosiągalny adres')
 
+    code, err = None, None
     try:
-        r = SESSION.head(url, timeout=LINK_TIMEOUT, allow_redirects=True)
-        if r.status_code >= 400:
-            # część serwerów nie obsługuje HEAD - próbujemy GET
-            r = SESSION.get(url, timeout=LINK_TIMEOUT, stream=True,
-                            allow_redirects=True)
-            r.close()
-        code = r.status_code
-        if code < 400:
-            result = ('OK', str(code))
-        elif code in UNCERTAIN_CODES:
-            result = ('NIEPEWNE', str(code))
-        else:
-            result = ('BLAD', str(code))
+        code = _http_status(url)
     except requests.RequestException as e:
-        result = ('BLAD', type(e).__name__)
+        err = type(e).__name__
+
+    if code is not None and code < 400:
+        result = ('OK', str(code))
+    else:
+        code2 = _second_opinion(url)
+        if code2 is not None and code2 < 400:
+            result = ('OK', f'{code2} (potwierdzone drugim klientem)')
+        else:
+            final = code2 if code2 is not None else code
+            if final is not None:
+                result = (_classify(final), str(final))
+            else:
+                is_timeout = err in ('Timeout', 'ReadTimeout', 'ConnectTimeout')
+                result = ('NIEPEWNE' if is_timeout else 'BLAD', err)
 
     with _cache_lock:
         _link_cache[url] = result
@@ -339,32 +391,83 @@ def extract_article_links(soup, page_url):
 
 
 def find_content_area(soup):
-    return (soup.find('div', itemprop='articleBody')
-            or soup.find('article')
-            or soup.find('div', class_='item-page'))
+    """Szuka obszaru treści; przy kilku kandydatach tego samego typu bierze
+    ten z największą ilością tekstu (a nie pierwszy z brzegu)."""
+    for candidates in (soup.find_all('div', itemprop='articleBody'),
+                       soup.find_all('article'),
+                       soup.find_all('div', class_='item-page')):
+        if candidates:
+            return max(candidates, key=lambda c: len(c.get_text(' ', strip=True)))
+    return None
+
+
+def _in_skipped_block(a, area):
+    for parent in a.parents:
+        if parent is area:
+            break
+        if parent.name in SKIP_TAGS:
+            return True
+        cls = ' '.join(parent.get('class') or [])
+        if cls and SKIP_CLASS_RE.search(cls):
+            return True
+    return False
 
 
 def extract_article_external_links(content_area, page_url):
+    """Wszystkie linki zewnętrzne w obszarze treści (nie tylko z <p> i <li>)."""
     base_domain = normalize_host(urlparse(page_url).netloc)
     links = []
-    for tag in content_area.find_all(['p', 'li']):
-        for a in tag.find_all('a', href=True):
-            raw = a['href'].strip()
-            if not raw or raw.startswith('#'):
-                continue
-            href = urljoin(page_url, raw)
-            if urlparse(href).scheme not in ('http', 'https'):
-                continue
-            if 'facebook.com/sharer' in href:
-                continue
-            if is_external(href, base_domain) and href not in links:
-                links.append(href)
+    for a in content_area.find_all('a', href=True):
+        raw = a['href'].strip()
+        if not raw or raw.startswith('#'):
+            continue
+        href = urljoin(page_url, raw)
+        if urlparse(href).scheme not in ('http', 'https'):
+            continue
+        host = normalize_host(urlparse(href).netloc)
+        if any(host == h or host.endswith('.' + h) for h in SOCIAL_HOSTS):
+            continue
+        if _in_skipped_block(a, content_area):
+            continue
+        if is_external(href, base_domain) and href not in links:
+            links.append(href)
     return links
 
 
 def _article_rows(firm, article_url, links):
     for link, (status, desc) in zip(links, check_many(links)):
         yield _row(firm, 'Artykuł', article_url, link, status, desc)
+
+
+def diagnose_article(url):
+    """Pokazuje, co skrypt widzi w artykule: obszar treści i wszystkie linki zewnętrzne."""
+    soup = fetch_soup(url)
+    if soup is None:
+        print('Nie udało się pobrać strony.')
+        return
+    area = find_content_area(soup)
+    base_domain = normalize_host(urlparse(url).netloc)
+    if area is None:
+        print('Obszar treści: NIE ZNALEZIONO')
+    else:
+        print(f"Obszar treści: <{area.name}> class={area.get('class')} "
+              f"itemprop={area.get('itemprop')} "
+              f"({len(area.get_text(' ', strip=True))} znaków)")
+    print('Linki zewnętrzne na stronie:')
+    for a in soup.find_all('a', href=True):
+        href = urljoin(url, a['href'].strip())
+        if urlparse(href).scheme not in ('http', 'https') or not is_external(href, base_domain):
+            continue
+        inside = area is not None and area in list(a.parents)
+        skipped = inside and _in_skipped_block(a, area)
+        place = 'W TREŚCI' if inside else 'POZA TREŚCIĄ'
+        if skipped:
+            place += ', POMINIĘTY'
+        chain = ' > '.join(
+            f"{p.name}" + (f".{'.'.join(p.get('class') or [])}" if p.get('class') else '')
+            for p in list(a.parents)[:4][::-1])
+        print(f"  [{place}] {href}")
+        print(f"      tekst: {a.get_text(' ', strip=True)[:60]!r} | rodzice: {chain}")
 
 
 # ---------------------------------------------------------------- audyt
@@ -434,9 +537,15 @@ def main():
     parser.add_argument('-o', '--output', default='raport_firmy.csv')
     parser.add_argument('--debug', action='store_true',
                         help='tylko wypisz znalezione linki (bez sprawdzania i CSV)')
+    parser.add_argument('--diagnose', metavar='URL_ARTYKULU',
+                        help='pokaż, jakie linki skrypt widzi w jednym artykule')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+    if args.diagnose:
+        diagnose_article(args.diagnose)
+        return
 
     urls = list(args.urls)
     if args.input:
