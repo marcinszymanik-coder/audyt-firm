@@ -8,9 +8,11 @@ Audyt linków firmy na budujemydom.pl:
 Użycie jako skrypt:
   python audyt_firmy.py https://budujemydom.pl/irbj/.../fakro
   python audyt_firmy.py -i firmy.txt -o raport.csv
-  python audyt_firmy.py URL --debug              # pokaż znalezione linki, bez sprawdzania
-  python audyt_firmy.py --diagnose URL_ARTYKULU  # co skrypt widzi w jednym artykule
-  (bez argumentów skrypt zapyta o linki)
+  python audyt_firmy.py URL --debug                    # pokaż znalezione linki, bez sprawdzania
+  python audyt_firmy.py --diagnose URL_ARTYKULU        # co skrypt widzi w jednym artykule
+  python audyt_firmy.py --diagnose-product URL         # przyciski "Zobacz..." na liście / stronie produktu
+  (bez argumentów skrypt zapyta o linki; w pytaniu można też wpisać
+   "--diagnose-product URL" albo "--diagnose URL")
 
 Użycie jako moduł (Streamlit): audit_firm(url, include_products=..., include_articles=...)
 """
@@ -49,6 +51,10 @@ PRODUCT_PATH_RE = re.compile(r'/p/\d+-[^/]+/?$')   # np. /firma/p/30376-nazwa
 STRIP_TAB_RE = re.compile(r'(/(porady|newsy))?(/s/\d+)?/?$')
 HEADING_TAGS = ['h1', 'h2', 'h3', 'h4', 'h5']
 
+# błędny zapis schematu w CMS, np. "http:///host" albo "http:/host"
+MALFORMED_SCHEME_RE = re.compile(r'^(https?):/*(?=[^/])', re.I)
+MALFORMED_NOTE = 'adres zapisany błędnie w CMS (np. "http:///") - warto poprawić link'
+
 # wyłączenia przy szukaniu linków w treści artykułu
 SKIP_TAGS = ['header', 'nav', 'footer', 'aside', 'form']
 SKIP_CLASS_RE = re.compile(r'(share|social|author|autor|breadcrumb|comment|newsletter|related)', re.I)
@@ -83,6 +89,7 @@ def make_session():
 SESSION = make_session()
 _link_cache = {}
 _outbound_cache = {}
+_MALFORMED = set()             # adresy naprawione z błędnego zapisu
 _cache_lock = threading.Lock()
 
 
@@ -90,6 +97,7 @@ def clear_cache():
     with _cache_lock:
         _link_cache.clear()
         _outbound_cache.clear()
+        _MALFORMED.clear()
 
 
 def is_safe_url(url):
@@ -216,6 +224,25 @@ def firm_base_url(url):
     return STRIP_TAB_RE.sub('', url)
 
 
+def _join(base, raw):
+    """urljoin z naprawą błędnego zapisu schematu (http:///host, http:/host).
+    Naprawiony adres jest zapamiętany, żeby dopisać uwagę w raporcie."""
+    raw = raw.strip()
+    fixed = MALFORMED_SCHEME_RE.sub(lambda m: m.group(1) + '://', raw)
+    url = urljoin(base, fixed)
+    if fixed != raw:
+        with _cache_lock:
+            _MALFORMED.add(url)
+    return url
+
+
+def _with_note(link, desc):
+    """Dopisuje uwagę do opisu, jeśli adres był błędnie zapisany w CMS."""
+    if link in _MALFORMED:
+        return f'{desc} ({MALFORMED_NOTE})'
+    return desc
+
+
 def _row(firm, typ, url, link, status, desc):
     return {'Firma_URL': firm, 'Typ': typ, 'URL': url,
             'Link': link, 'Status': status, 'Opis': desc}
@@ -268,7 +295,8 @@ def extract_product_items(soup, page_url):
     """Zwraca listę produktów z listy firmy:
     {'name', 'product_url', 'outbound', 'page'}
       outbound - link z przycisku, jeśli prowadzi poza budujemydom.pl (inaczej None),
-      page     - strona do pobrania, gdy trzeba z niej wyciągnąć link do producenta.
+      page     - adres do rozwiązania (strona produktu lub wewnętrzne przekierowanie),
+                 gdy przycisk nie prowadzi bezpośrednio do producenta.
     Nazwę (tylko do trybu debug) i adres produktu szuka w najmniejszym kontenerze
     wokół przycisku, który zawiera tylko jeden przycisk produktowy."""
     base_domain = normalize_host(urlparse(page_url).netloc)
@@ -277,7 +305,7 @@ def extract_product_items(soup, page_url):
     for btn in soup.find_all('a', href=True):
         if not _is_product_btn(btn):
             continue
-        btn_href = urljoin(page_url, btn['href'].strip())
+        btn_href = _join(page_url, btn['href'])
         if urlparse(btn_href).scheme not in ('http', 'https'):
             continue
 
@@ -314,35 +342,75 @@ def extract_product_items(soup, page_url):
             name = _slug_name(product_url)
 
         outbound = btn_href if is_external(btn_href, base_domain) else None
+        if outbound is not None:
+            page = product_url
+        else:
+            # przycisk wewnętrzny: użyj jego adresu, ale nie samej strony listy
+            # (np. href="#"), bo dałoby to link z innego produktu
+            same_as_list = clean_url(btn_href) == clean_url(page_url)
+            page = product_url if same_as_list else btn_href
+
         key = product_url or btn_href
         if key in seen:
             continue
         seen.add(key)
         items.append({'name': name, 'product_url': product_url,
-                      'outbound': outbound,
-                      'page': btn_href if outbound is None else product_url})
+                      'outbound': outbound, 'page': page})
     return items
 
 
+def _final_url(url):
+    """Adres po wszystkich przekierowaniach (None przy błędzie)."""
+    try:
+        r = SESSION.get(url, timeout=PAGE_TIMEOUT, stream=True, allow_redirects=True)
+        final = r.url
+        r.close()
+        return final
+    except requests.RequestException:
+        return None
+
+
 def resolve_outbound(product_page_url):
-    """Z wewnętrznej strony produktu wyciąga link do producenta (lub None)."""
+    """Z wewnętrznego adresu (strona produktu lub przekierowanie) wyciąga link do producenta.
+    Obsługuje: przekierowanie wychodzące poza serwis, zewnętrzny href przycisku
+    oraz przycisk będący wewnętrznym przekierowaniem na stronę producenta."""
     if not product_page_url:
         return None
     with _cache_lock:
         if product_page_url in _outbound_cache:
             return _outbound_cache[product_page_url]
-    soup = fetch_soup(product_page_url)
-    time.sleep(DELAY)
+
     result = None
-    if soup is not None:
-        base_domain = normalize_host(urlparse(product_page_url).netloc)
-        for a in soup.find_all('a', href=True):
-            if _is_product_btn(a):
-                href = urljoin(product_page_url, a['href'].strip())
-                if (urlparse(href).scheme in ('http', 'https')
-                        and is_external(href, base_domain)):
+    base_domain = normalize_host(urlparse(product_page_url).netloc)
+    try:
+        r = SESSION.get(product_page_url, timeout=PAGE_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as e:
+        log.warning('Błąd pobierania %s (%s)', product_page_url, type(e).__name__)
+        r = None
+    time.sleep(DELAY)
+
+    if r is not None:
+        if is_external(r.url, base_domain):
+            result = r.url                      # przekierowanie wyszło poza serwis
+        elif r.status_code == 200:
+            soup = BeautifulSoup(r.content, 'html.parser')
+            for a in soup.find_all('a', href=True):
+                if not _is_product_btn(a):
+                    continue
+                href = _join(r.url, a['href'])
+                if urlparse(href).scheme not in ('http', 'https'):
+                    continue
+                if is_external(href, base_domain):
                     result = href
                     break
+                if clean_url(href) != clean_url(r.url):
+                    final = _final_url(href)    # wewnętrzny adres - sprawdź dokąd prowadzi
+                    if final and is_external(final, base_domain):
+                        result = final
+                        break
+        else:
+            log.warning('HTTP %s dla %s', r.status_code, product_page_url)
+
     with _cache_lock:
         _outbound_cache[product_page_url] = result
     return result
@@ -363,6 +431,7 @@ def _product_rows(firm, page_url, items):
             status, desc = 'BRAK', 'Nie znaleziono linku do producenta'
         else:
             status, desc = status_map[link]
+            desc = _with_note(link, desc)
         # w raporcie: URL = adres produktu, kolumna Link pusta
         yield _row(firm, 'Produkt', product_ref, '', status, desc)
 
@@ -421,7 +490,7 @@ def extract_article_external_links(content_area, page_url):
         raw = a['href'].strip()
         if not raw or raw.startswith('#'):
             continue
-        href = urljoin(page_url, raw)
+        href = _join(page_url, raw)
         if urlparse(href).scheme not in ('http', 'https'):
             continue
         host = normalize_host(urlparse(href).netloc)
@@ -436,8 +505,11 @@ def extract_article_external_links(content_area, page_url):
 
 def _article_rows(firm, article_url, links):
     for link, (status, desc) in zip(links, check_many(links)):
-        yield _row(firm, 'Artykuł', article_url, link, status, desc)
+        yield _row(firm, 'Artykuł', article_url, link, status,
+                   _with_note(link, desc))
 
+
+# ---------------------------------------------------------------- diagnostyka
 
 def diagnose_article(url):
     """Pokazuje, co skrypt widzi w artykule: obszar treści i wszystkie linki zewnętrzne."""
@@ -455,7 +527,7 @@ def diagnose_article(url):
               f"({len(area.get_text(' ', strip=True))} znaków)")
     print('Linki zewnętrzne na stronie:')
     for a in soup.find_all('a', href=True):
-        href = urljoin(url, a['href'].strip())
+        href = _join(url, a['href'])
         if urlparse(href).scheme not in ('http', 'https') or not is_external(href, base_domain):
             continue
         inside = area is not None and area in list(a.parents)
@@ -468,6 +540,40 @@ def diagnose_article(url):
             for p in list(a.parents)[:4][::-1])
         print(f"  [{place}] {href}")
         print(f"      tekst: {a.get_text(' ', strip=True)[:60]!r} | rodzice: {chain}")
+
+
+def diagnose_product(url):
+    """Pokazuje wszystkie elementy 'Zobacz na stronie producenta' / 'Zobacz...'
+    na stronie (lista firmy lub strona produktu) - z surowymi atrybutami."""
+    try:
+        resp = SESSION.get(url, timeout=PAGE_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as e:
+        print(f'Błąd pobierania: {type(e).__name__}')
+        return
+    print(f'HTTP {resp.status_code} | adres końcowy: {resp.url}')
+    soup = BeautifulSoup(resp.content, 'html.parser')
+
+    print('\n== Elementy z tekstem "Zobacz na stronie producenta" (dowolny znacznik) ==')
+    nodes = soup.find_all(string=re.compile(PRODUCT_BTN_TEXT, re.I))
+    print(f'Znaleziono: {len(nodes)}')
+    for i, node in enumerate(nodes, 1):
+        el = node.parent
+        attrs = {k: v for k, v in el.attrs.items()}
+        parent = el.parent
+        print(f'  {i}. <{el.name}> atrybuty: {attrs}')
+        if parent is not None:
+            print(f'      rodzic: <{parent.name}> {dict(list(parent.attrs.items())[:4])}')
+        if i >= 6:
+            print('  ... (pokazano pierwsze 6)')
+            break
+
+    print('\n== Wszystkie linki zaczynające się od "Zobacz" ==')
+    for a in soup.find_all('a'):
+        text = a.get_text(' ', strip=True)
+        if text.lower().startswith('zobacz'):
+            print(f"  tekst: {text!r}")
+            print(f"    href: {a.get('href')!r} | class: {a.get('class')} "
+                  f"| target: {a.get('target')} | rel: {a.get('rel')}")
 
 
 # ---------------------------------------------------------------- audyt
@@ -487,9 +593,8 @@ def audit_firm(firm_url, debug=False, include_products=True, include_articles=Tr
             found_products = found_products or bool(items)
             if debug:
                 for it in items:
-                    print(f"[PRODUKT] {it['name'] or '(brak nazwy)'} | "
-                          f"{it['product_url'] or '(brak adresu produktu)'} | "
-                          f"{it['outbound'] or '(link przez stronę produktu)'}")
+                    print(f"[PRODUKT] {it['product_url'] or '(brak adresu produktu)'} | "
+                          f"{it['outbound'] or '(przez: ' + (it['page'] or 'brak') + ')'}")
                 continue
             yield from _product_rows(base, page_url, items)
         if not found_products and not debug:
@@ -539,12 +644,17 @@ def main():
                         help='tylko wypisz znalezione linki (bez sprawdzania i CSV)')
     parser.add_argument('--diagnose', metavar='URL_ARTYKULU',
                         help='pokaż, jakie linki skrypt widzi w jednym artykule')
+    parser.add_argument('--diagnose-product', metavar='URL',
+                        help='pokaż przyciski "Zobacz..." na liście firmy lub stronie produktu')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
     if args.diagnose:
         diagnose_article(args.diagnose)
+        return
+    if args.diagnose_product:
+        diagnose_product(args.diagnose_product)
         return
 
     urls = list(args.urls)
@@ -553,8 +663,16 @@ def main():
             urls += [l.strip() for l in f if l.strip()]
 
     if not urls:  # uruchomienie bez argumentów (np. IDLE) - zapytaj
-        raw = input('Wklej link(i) do firm (oddziel spacją): ').strip()
-        urls = raw.split()
+        raw = input('Wklej link(i) do firm (oddziel spacją) '
+                    'albo "--diagnose-product URL" / "--diagnose URL": ').strip()
+        parts = raw.split()
+        if len(parts) >= 2 and parts[0] == '--diagnose-product':
+            diagnose_product(parts[1])
+            return
+        if len(parts) >= 2 and parts[0] == '--diagnose':
+            diagnose_article(parts[1])
+            return
+        urls = parts
         if input('Tryb debug (tylko podgląd linków)? [t/N]: ').strip().lower() == 't':
             args.debug = True
 
