@@ -138,9 +138,15 @@ def main():
     sel_types = f2.multiselect("Typ", types, default=types, key="flt_typ")
     hide_done = f3.checkbox("Ukryj sprawdzone", value=False, key="flt_hide_done")
 
-    mask = df["Status"].isin(sel_status) & df["Typ"].isin(sel_types)
-    if hide_done:
-        mask &= ~df.index.isin(list(checked))
+    base_mask = df["Status"].isin(sel_status) & df["Typ"].isin(sel_types)
+
+    # adresy URL, dla których zaznaczono choć jeden wiersz (puste pomijamy)
+    checked_urls = ({u for u in df.loc[sorted(checked), "URL"] if u}
+                    if checked else set())
+    done_mask = df["URL"].isin(checked_urls) | df.index.isin(list(checked))
+
+    mask = base_mask & ~done_mask if hide_done else base_mask
+    hidden_n = int((base_mask & done_mask).sum()) if hide_done else 0
     view = df[mask].copy()
     view.insert(0, "Sprawdzone", view.index.isin(list(checked)))
     for col in ("URL", "Link"):
@@ -151,8 +157,9 @@ def main():
         columns.insert(1, "Firma_URL")
 
     p1, p2 = st.columns([3, 1])
-    p1.caption(f"Sprawdzone: {len(checked)} z {len(df)} · "
-               f"widoczne wiersze: {len(view)}")
+    p1.caption(
+        f"Sprawdzone: {len(checked)} z {len(df)} · widoczne wiersze: {len(view)}"
+        + (f" · ukryte (ten sam URL co sprawdzone): {hidden_n}" if hide_done else ""))
     if p2.button("Wyczyść zaznaczenia", key="btn_clear_checked"):
         checked.clear()
         bump_editor_version()
