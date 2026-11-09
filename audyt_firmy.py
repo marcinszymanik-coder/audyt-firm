@@ -9,15 +9,17 @@ Użycie jako skrypt:
   python audyt_firmy.py https://budujemydom.pl/irbj/.../fakro
   python audyt_firmy.py -i firmy.txt -o raport.csv
   python audyt_firmy.py URL --debug                    # pokaż znalezione linki, bez sprawdzania
+  python audyt_firmy.py --check-link URL               # sprawdź jeden link zewnętrzny
   python audyt_firmy.py --diagnose URL_ARTYKULU        # co skrypt widzi w jednym artykule
   python audyt_firmy.py --diagnose-product URL         # przyciski "Zobacz..." na liście / stronie produktu
   (bez argumentów skrypt zapyta o linki; w pytaniu można też wpisać
-   "--diagnose-product URL" albo "--diagnose URL")
+   "--check-link URL", "--diagnose-product URL" albo "--diagnose URL")
 
 Użycie jako moduł (Streamlit): audit_firm(url, include_products=..., include_articles=...)
 """
 import argparse
 import csv
+import difflib
 import ipaddress
 import logging
 import re
@@ -55,11 +57,23 @@ HEADING_TAGS = ['h1', 'h2', 'h3', 'h4', 'h5']
 MALFORMED_SCHEME_RE = re.compile(r'^(https?):/*(?=[^/])', re.I)
 MALFORMED_NOTE = 'adres zapisany błędnie w CMS (np. "http:///") - warto poprawić link'
 
+# wykrywanie "miękkich 404" (strona zwraca 200, ale to błąd / strona główna)
+SOFT_CHECK_BYTES = 200 * 1024            # ile bajtów strony analizować
+SOFT_404_STATUS = 'BLAD'                 # komunikat o błędzie 404 w treści
+HOME_FALLBACK_STATUS = 'BLAD'            # przekierowanie / treść jak strona główna
+ROOT_PATHS = {'', '/index.html', '/index.htm', '/index.php', '/home', '/start'}
+SOFT_404_RE = re.compile(
+    r'(błąd\s*404|blad\s*404|error\s*404|404\s*error|404\s*[-–:]?\s*not\s*found'
+    r'|page\s+not\s+found|strona\s+nie\s+istnieje|podana\s+strona\s+nie\s+istnieje'
+    r'|strona\s+nie\s+została\s+znaleziona|nie\s+znaleziono\s+strony)', re.I)
+
 # wyłączenia przy szukaniu linków w treści artykułu
 SKIP_TAGS = ['header', 'nav', 'footer', 'aside', 'form']
 SKIP_CLASS_RE = re.compile(r'(share|social|author|autor|breadcrumb|comment|newsletter|related)', re.I)
 SOCIAL_HOSTS = ('facebook.com', 'twitter.com', 'x.com', 'linkedin.com',
                 'pinterest.com', 'whatsapp.com', 'wa.me')
+# stałe elementy szablonu serwisu (nie są linkami z treści artykułu)
+IGNORED_LINK_PATTERNS = ('google.com/preferences/source',)
 
 # URL = adres produktu (dla produktów) lub adres artykułu (dla artykułów)
 FIELDNAMES = ['Firma_URL', 'Typ', 'URL', 'Link', 'Status', 'Opis']
@@ -89,6 +103,7 @@ def make_session():
 SESSION = make_session()
 _link_cache = {}
 _outbound_cache = {}
+_home_cache = {}               # strony główne domen (do wykrywania miękkich 404)
 _MALFORMED = set()             # adresy naprawione z błędnego zapisu
 _cache_lock = threading.Lock()
 
@@ -97,6 +112,7 @@ def clear_cache():
     with _cache_lock:
         _link_cache.clear()
         _outbound_cache.clear()
+        _home_cache.clear()
         _MALFORMED.clear()
 
 
@@ -116,13 +132,21 @@ def is_safe_url(url):
         return False
 
 
-def _http_status(url):
-    """HEAD, a przy błędzie GET. Zwraca kod HTTP; wyjątki sieciowe propaguje."""
-    r = SESSION.head(url, timeout=LINK_TIMEOUT, allow_redirects=True)
-    if r.status_code >= 400:
-        r = SESSION.get(url, timeout=LINK_TIMEOUT, stream=True, allow_redirects=True)
+def _fetch_for_check(url):
+    """GET ze strumieniem. Zwraca (kod, adres_końcowy, treść).
+    Treść (do SOFT_CHECK_BYTES) tylko dla stron HTML ze statusem < 400."""
+    r = SESSION.get(url, timeout=LINK_TIMEOUT, stream=True, allow_redirects=True)
+    try:
+        body = b''
+        ctype = (r.headers.get('Content-Type') or '').lower()
+        if r.status_code < 400 and 'html' in ctype:
+            for chunk in r.iter_content(chunk_size=8192):
+                body += chunk
+                if len(body) >= SOFT_CHECK_BYTES:
+                    break
+        return r.status_code, r.url, body
+    finally:
         r.close()
-    return r.status_code
 
 
 def _second_opinion(url):
@@ -146,8 +170,74 @@ def _classify(code):
     return 'BLAD'
 
 
+def _is_root(path):
+    return path.rstrip('/').lower() in ROOT_PATHS
+
+
+def _visible_text(soup):
+    for tag in soup(['script', 'style', 'noscript']):
+        tag.decompose()
+    return ' '.join(soup.get_text(' ', strip=True).split()).lower()
+
+
+def _homepage(scheme, netloc):
+    """(tekst strony głównej, ścieżka po przekierowaniach) albo None. Z cache."""
+    key = f'{scheme}://{netloc}'
+    with _cache_lock:
+        if key in _home_cache:
+            return _home_cache[key]
+    result = None
+    home_url = key + '/'
+    if is_safe_url(home_url):
+        try:
+            code, final, body = _fetch_for_check(home_url)
+            if code < 400 and body:
+                result = (_visible_text(BeautifulSoup(body, 'html.parser')),
+                          urlparse(final).path)
+        except requests.RequestException:
+            pass
+    with _cache_lock:
+        _home_cache[key] = result
+    return result
+
+
+def _soft_problem(url, code, final_url, body):
+    """Wykrywa "miękkie 404": status 200, ale w rzeczywistości błąd lub strona główna.
+    Zwraca (status, opis) albo None, gdy wszystko w porządku."""
+    o, f = urlparse(url), urlparse(final_url)
+
+    # 1) przekierowanie głębokiego adresu na stronę główną
+    if not _is_root(o.path) and _is_root(f.path):
+        return (HOME_FALLBACK_STATUS,
+                f'{code}, ale przekierowano na stronę główną ({final_url})')
+    if not body:
+        return None
+
+    soup = BeautifulSoup(body, 'html.parser')
+    text = _visible_text(soup)
+
+    # 2) komunikat o błędzie 404 w treści
+    if SOFT_404_RE.search(text[:600]):
+        return (SOFT_404_STATUS,
+                f'{code}, ale strona zawiera komunikat o błędzie 404 (brak podstrony)')
+
+    # 3) treść identyczna ze stroną główną domeny (głęboki adres, brak przekierowania)
+    if not _is_root(o.path) and len(text) > 200:
+        home = _homepage(f.scheme, f.netloc)
+        if home:
+            home_text, home_final_path = home
+            if (len(home_text) > 200
+                    and home_final_path.rstrip('/') != f.path.rstrip('/')):
+                if (text == home_text or difflib.SequenceMatcher(
+                        None, text[:3000], home_text[:3000]).ratio() >= 0.97):
+                    return (HOME_FALLBACK_STATUS,
+                            f'{code}, ale treść identyczna ze stroną główną (brak podstrony?)')
+    return None
+
+
 def check_external_link(url):
     """Zwraca ('OK' | 'NIEPEWNE' | 'BLAD', opis). Wyniki są cache'owane.
+    Sprawdza kod HTTP oraz "miękkie 404" (200, ale błąd / strona główna).
     Błąd jest potwierdzany drugim klientem, żeby ograniczyć fałszywe alarmy."""
     with _cache_lock:
         if url in _link_cache:
@@ -157,13 +247,14 @@ def check_external_link(url):
         return ('BLAD', 'Niedozwolony lub nieosiągalny adres')
 
     code, err = None, None
+    final_url, body = url, b''
     try:
-        code = _http_status(url)
+        code, final_url, body = _fetch_for_check(url)
     except requests.RequestException as e:
         err = type(e).__name__
 
     if code is not None and code < 400:
-        result = ('OK', str(code))
+        result = _soft_problem(url, code, final_url, body) or ('OK', str(code))
     else:
         code2 = _second_opinion(url)
         if code2 is not None and code2 < 400:
@@ -496,6 +587,8 @@ def extract_article_external_links(content_area, page_url):
         host = normalize_host(urlparse(href).netloc)
         if any(host == h or host.endswith('.' + h) for h in SOCIAL_HOSTS):
             continue
+        if any(p in href for p in IGNORED_LINK_PATTERNS):
+            continue
         if _in_skipped_block(a, content_area):
             continue
         if is_external(href, base_domain) and href not in links:
@@ -535,6 +628,8 @@ def diagnose_article(url):
         place = 'W TREŚCI' if inside else 'POZA TREŚCIĄ'
         if skipped:
             place += ', POMINIĘTY'
+        if any(p in href for p in IGNORED_LINK_PATTERNS):
+            place += ', IGNOROWANY (szablon)'
         chain = ' > '.join(
             f"{p.name}" + (f".{'.'.join(p.get('class') or [])}" if p.get('class') else '')
             for p in list(a.parents)[:4][::-1])
@@ -574,6 +669,12 @@ def diagnose_product(url):
             print(f"  tekst: {text!r}")
             print(f"    href: {a.get('href')!r} | class: {a.get('class')} "
                   f"| target: {a.get('target')} | rel: {a.get('rel')}")
+
+
+def check_one_link(url):
+    """Sprawdza pojedynczy link zewnętrzny i wypisuje wynik."""
+    status, desc = check_external_link(url)
+    print(f'{status} | {desc}')
 
 
 # ---------------------------------------------------------------- audyt
@@ -642,6 +743,8 @@ def main():
     parser.add_argument('-o', '--output', default='raport_firmy.csv')
     parser.add_argument('--debug', action='store_true',
                         help='tylko wypisz znalezione linki (bez sprawdzania i CSV)')
+    parser.add_argument('--check-link', metavar='URL',
+                        help='sprawdź jeden link zewnętrzny i wypisz wynik')
     parser.add_argument('--diagnose', metavar='URL_ARTYKULU',
                         help='pokaż, jakie linki skrypt widzi w jednym artykule')
     parser.add_argument('--diagnose-product', metavar='URL',
@@ -650,6 +753,9 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+    if args.check_link:
+        check_one_link(args.check_link)
+        return
     if args.diagnose:
         diagnose_article(args.diagnose)
         return
@@ -663,9 +769,12 @@ def main():
             urls += [l.strip() for l in f if l.strip()]
 
     if not urls:  # uruchomienie bez argumentów (np. IDLE) - zapytaj
-        raw = input('Wklej link(i) do firm (oddziel spacją) '
-                    'albo "--diagnose-product URL" / "--diagnose URL": ').strip()
+        raw = input('Wklej link(i) do firm (oddziel spacją) albo '
+                    '"--check-link URL" / "--diagnose-product URL" / "--diagnose URL": ').strip()
         parts = raw.split()
+        if len(parts) >= 2 and parts[0] == '--check-link':
+            check_one_link(parts[1])
+            return
         if len(parts) >= 2 and parts[0] == '--diagnose-product':
             diagnose_product(parts[1])
             return
