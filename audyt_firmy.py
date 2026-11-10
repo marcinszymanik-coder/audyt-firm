@@ -61,6 +61,10 @@ MALFORMED_NOTE = 'adres zapisany błędnie w CMS (np. "http:///") - warto popraw
 SOFT_CHECK_BYTES = 200 * 1024            # ile bajtów strony analizować
 SOFT_404_STATUS = 'BLAD'                 # komunikat o błędzie 404 w treści
 HOME_FALLBACK_STATUS = 'BLAD'            # przekierowanie / treść jak strona główna
+# porównywanie treści ze stroną główną bywa zawodne (strony ładowane skryptem,
+# wspólne menu), więc jest domyślnie wyłączone; przekierowania na stronę
+# główną i komunikaty 404 są wykrywane niezależnie
+HOME_CONTENT_CHECK = False
 ROOT_PATHS = {'', '/index.html', '/index.htm', '/index.php', '/home', '/start'}
 SOFT_404_RE = re.compile(
     r'(błąd\s*404|blad\s*404|error\s*404|404\s*error|404\s*[-–:]?\s*not\s*found'
@@ -221,17 +225,16 @@ def _soft_problem(url, code, final_url, body):
         return (SOFT_404_STATUS,
                 f'{code}, ale strona zawiera komunikat o błędzie 404 (brak podstrony)')
 
-    # 3) treść identyczna ze stroną główną domeny (głęboki adres, brak przekierowania)
-    if not _is_root(o.path) and len(text) > 200:
+    # 3) (opcjonalnie) treść identyczna ze stroną główną domeny
+    if HOME_CONTENT_CHECK and not _is_root(o.path) and len(text) > 200:
         home = _homepage(f.scheme, f.netloc)
         if home:
             home_text, home_final_path = home
             if (len(home_text) > 200
-                    and home_final_path.rstrip('/') != f.path.rstrip('/')):
-                if (text == home_text or difflib.SequenceMatcher(
-                        None, text[:3000], home_text[:3000]).ratio() >= 0.97):
-                    return (HOME_FALLBACK_STATUS,
-                            f'{code}, ale treść identyczna ze stroną główną (brak podstrony?)')
+                    and home_final_path.rstrip('/') != f.path.rstrip('/')
+                    and text == home_text):
+                return (HOME_FALLBACK_STATUS,
+                        f'{code}, ale treść identyczna ze stroną główną (brak podstrony?)')
     return None
 
 
@@ -264,7 +267,8 @@ def check_external_link(url):
             if final is not None:
                 result = (_classify(final), str(final))
             else:
-                is_timeout = err in ('Timeout', 'ReadTimeout', 'ConnectTimeout')
+                # timeout i błąd certyfikatu SSL nie oznaczają martwego linku
+                is_timeout = err in ('Timeout', 'ReadTimeout', 'ConnectTimeout', 'SSLError')
                 result = ('NIEPEWNE' if is_timeout else 'BLAD', err)
 
     with _cache_lock:
